@@ -188,6 +188,47 @@ DESCRIBE_TRAINING_FAILED_RETURN.update({"TrainingJobStatus": "Failed", "FailureR
 DESCRIBE_TRAINING_STOPPING_RETURN = dict(DESCRIBE_TRAINING_COMPLETED_RETURN)
 DESCRIBE_TRAINING_STOPPING_RETURN.update({"TrainingJobStatus": "Stopping"})
 
+DESCRIBE_TRAINING_PREFERENCES_RETURN = dict(DESCRIBE_TRAINING_COMPLETED_RETURN)
+DESCRIBE_TRAINING_PREFERENCES_RETURN.update(
+    {
+        "ResourceConfig": {
+            "InstanceCount": 0,
+            "InstancePreferences": [
+                {"InstanceType": "ml.g6.48xlarge", "InstanceCount": 2},
+                {"InstanceType": "ml.g5.48xlarge", "InstanceCount": 4},
+            ],
+            "SelectedInstanceType": "ml.g5.48xlarge",
+            "SelectedInstanceCount": 4,
+            "VolumeSizeInGB": 10,
+        }
+    }
+)
+
+DESCRIBE_TRAINING_PENDING_CAPACITY_RETURN = dict(DESCRIBE_TRAINING_COMPLETED_RETURN)
+DESCRIBE_TRAINING_PENDING_CAPACITY_RETURN.update(
+    {
+        "ResourceConfig": {
+            "InstanceCount": 0,
+            "InstancePreferences": [{"InstanceType": "ml.g5.48xlarge", "InstanceCount": 4}],
+            "VolumeSizeInGB": 10,
+        }
+    }
+)
+
+DESCRIBE_TRAINING_INSTANCE_GROUPS_RETURN = dict(DESCRIBE_TRAINING_COMPLETED_RETURN)
+DESCRIBE_TRAINING_INSTANCE_GROUPS_RETURN.update(
+    {
+        "ResourceConfig": {
+            "InstanceCount": 0,
+            "InstanceGroups": [
+                {"InstanceGroupName": "gpu", "InstanceType": "ml.p4d.24xlarge", "InstanceCount": 2},
+                {"InstanceGroupName": "data", "InstanceType": "ml.c5.18xlarge", "InstanceCount": 8},
+            ],
+            "VolumeSizeInGB": 10,
+        }
+    }
+)
+
 message = "message"
 status = "status"
 SECONDARY_STATUS_DESCRIPTION_1 = {
@@ -337,6 +378,40 @@ class TestSageMakerHook:
             create_training_params, wait_for_completion=True, print_log=False, check_interval=0
         )
         assert mock_session.describe_training_job.call_count == 3
+
+    @pytest.mark.parametrize(
+        ("describe_return", "expected_instance_count"),
+        [
+            pytest.param(DESCRIBE_TRAINING_PREFERENCES_RETURN, 4, id="selected-instance-count"),
+            pytest.param(DESCRIBE_TRAINING_INSTANCE_GROUPS_RETURN, 10, id="instance-groups"),
+            pytest.param(DESCRIBE_TRAINING_PENDING_CAPACITY_RETURN, None, id="waiting-for-capacity"),
+        ],
+    )
+    @mock.patch.object(SageMakerHook, "count_billable_seconds")
+    @mock.patch.object(SageMakerHook, "check_training_config")
+    @mock.patch.object(SageMakerHook, "get_conn")
+    @mock.patch("time.sleep", return_value=None)
+    def test_training_billable_seconds_when_resource_config_reports_no_count(
+        self, _, mock_client, mock_check_training, mock_count, describe_return, expected_instance_count
+    ):
+        mock_check_training.return_value = True
+        mock_session = mock.Mock()
+        attrs = {
+            "create_training_job.return_value": test_arn_return,
+            "describe_training_job.side_effect": [describe_return],
+        }
+        mock_session.configure_mock(**attrs)
+        mock_client.return_value = mock_session
+        hook = SageMakerHook(aws_conn_id="sagemaker_test_conn_id_1")
+
+        hook.create_training_job(
+            create_training_params, wait_for_completion=True, print_log=False, check_interval=0
+        )
+
+        if expected_instance_count is None:
+            mock_count.assert_not_called()
+        else:
+            assert mock_count.call_args.kwargs["instance_count"] == expected_instance_count
 
     @mock.patch.object(SageMakerHook, "check_training_config")
     @mock.patch.object(SageMakerHook, "get_conn")
@@ -590,6 +665,48 @@ class TestSageMakerHook:
         )
         assert response == (LogState.COMPLETE, {}, 0)
 
+    @pytest.mark.parametrize(
+        ("wait_for_completion", "expected_describe_calls", "expect_billing"),
+        [
+            pytest.param(True, 2, True, id="waits-for-completion"),
+            pytest.param(False, 1, False, id="does-not-wait"),
+        ],
+    )
+    @mock.patch.object(SageMakerHook, "count_billable_seconds")
+    @mock.patch.object(SageMakerHook, "describe_training_job_with_log")
+    @mock.patch.object(SageMakerHook, "describe_training_job")
+    @mock.patch.object(SageMakerHook, "get_conn")
+    def test_check_training_status_with_log_skips_tailing_without_instance_count(
+        self,
+        mock_client,
+        mock_describe,
+        mock_describe_with_log,
+        mock_count_billable_seconds,
+        wait_for_completion,
+        expected_describe_calls,
+        expect_billing,
+    ):
+        mock_describe.side_effect = [
+            DESCRIBE_TRAINING_PENDING_CAPACITY_RETURN,
+            DESCRIBE_TRAINING_PREFERENCES_RETURN,
+        ]
+        hook = SageMakerHook(aws_conn_id="sagemaker_test_conn_id")
+
+        hook.check_training_status_with_log(
+            "test_job",
+            SageMakerHook.non_terminal_states,
+            SageMakerHook.training_failed_states,
+            wait_for_completion=wait_for_completion,
+            check_interval=0,
+        )
+
+        mock_describe_with_log.assert_not_called()
+        assert mock_describe.call_count == expected_describe_calls
+        if expect_billing:
+            assert mock_count_billable_seconds.call_args.kwargs["instance_count"] == 4
+        else:
+            mock_count_billable_seconds.assert_not_called()
+
     @mock.patch.object(SageMakerHook, "check_training_config")
     @mock.patch.object(AwsLogsHook, "conn")
     @mock.patch.object(SageMakerHook, "get_conn")
@@ -622,6 +739,46 @@ class TestSageMakerHook:
         )
         assert mock_describe.call_count == 3
         assert mock_session.describe_training_job.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("cluster_config", "expected"),
+        [
+            pytest.param({"InstanceCount": 2}, 2, id="explicit-instance-count"),
+            pytest.param(
+                {
+                    "InstanceCount": 0,
+                    "InstancePreferences": [{"InstanceType": "ml.g5.48xlarge", "InstanceCount": 4}],
+                    "SelectedInstanceType": "ml.g5.48xlarge",
+                    "SelectedInstanceCount": 4,
+                },
+                4,
+                id="selected-instance-count",
+            ),
+            pytest.param(
+                {
+                    "InstanceCount": 0,
+                    "InstancePreferences": [{"InstanceType": "ml.g5.48xlarge", "InstanceCount": 4}],
+                },
+                None,
+                id="waiting-for-capacity",
+            ),
+            pytest.param({"InstanceCount": 0}, None, id="preferences-dropped-by-old-botocore"),
+            pytest.param(
+                {
+                    "InstanceCount": 0,
+                    "InstanceGroups": [
+                        {"InstanceGroupName": "gpu", "InstanceType": "ml.p4d.24xlarge", "InstanceCount": 2},
+                        {"InstanceGroupName": "data", "InstanceType": "ml.c5.18xlarge", "InstanceCount": 8},
+                    ],
+                },
+                10,
+                id="instance-groups-are-summed",
+            ),
+            pytest.param({}, None, id="no-resource-config"),
+        ],
+    )
+    def test_resolve_instance_count(self, cluster_config, expected):
+        assert SageMakerHook.resolve_instance_count(cluster_config) == expected
 
     @mock.patch.object(SageMakerHook, "get_conn")
     def test_count_processing_jobs_by_name(self, mock_conn):

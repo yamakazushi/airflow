@@ -1302,8 +1302,8 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
             description = self.hook.describe_training_job(self.config["TrainingJobName"])
             status = description["TrainingJobStatus"]
 
-            if self.print_log:
-                instance_count = description["ResourceConfig"]["InstanceCount"]
+            instance_count = SageMakerHook.resolve_instance_count(description.get("ResourceConfig", {}))
+            if self.print_log and instance_count is not None:
                 last_describe_job_call = time.monotonic()
                 job_already_completed = status not in self.hook.non_terminal_states
                 _, description, last_describe_job_call = self.hook.describe_training_job_with_log(
@@ -1322,7 +1322,7 @@ class SageMakerTrainingOperator(SageMakerBaseOperator):
                 raise AirflowException(f"SageMaker job failed because {reason}")
             if status == "Completed":
                 log_message = f"{self.task_id} completed successfully."
-                if self.print_log:
+                if self.print_log and instance_count is not None:
                     billable_seconds = SageMakerHook.count_billable_seconds(
                         training_start_time=description["TrainingStartTime"],
                         training_end_time=description["TrainingEndTime"],

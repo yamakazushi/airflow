@@ -224,13 +224,13 @@ class SageMakerTrainingSensor(SageMakerBaseSensor):
     def init_log_resource(self, hook: SageMakerHook) -> None:
         """Set tailing LogState for associated training job."""
         description = hook.describe_training_job(self.job_name)
-        self.instance_count = description["ResourceConfig"]["InstanceCount"]
+        self.instance_count = SageMakerHook.resolve_instance_count(description.get("ResourceConfig", {}))
         status = description["TrainingJobStatus"]
         job_already_completed = status not in self.non_terminal_states()
         self.state = LogState.COMPLETE if job_already_completed else LogState.TAILING
         self.last_description = description
         self.last_describe_job_call = time.monotonic()
-        self.log_resource_inited = True
+        self.log_resource_inited = self.instance_count is not None
 
     def non_terminal_states(self):
         return SageMakerHook.non_terminal_states
@@ -242,27 +242,32 @@ class SageMakerTrainingSensor(SageMakerBaseSensor):
         if self.print_log:
             if not self.log_resource_inited:
                 self.init_log_resource(self.hook)
-            (
-                self.state,
-                self.last_description,
-                self.last_describe_job_call,
-            ) = self.hook.describe_training_job_with_log(
-                self.job_name,
-                self.positions,
-                self.stream_names,
-                self.instance_count,
-                self.state,
-                self.last_description,
-                self.last_describe_job_call,
-            )
+            if self.log_resource_inited:
+                (
+                    self.state,
+                    self.last_description,
+                    self.last_describe_job_call,
+                ) = self.hook.describe_training_job_with_log(
+                    self.job_name,
+                    self.positions,
+                    self.stream_names,
+                    self.instance_count,
+                    self.state,
+                    self.last_description,
+                    self.last_describe_job_call,
+                )
         else:
             self.last_description = self.hook.describe_training_job(self.job_name)
         status = self.state_from_response(self.last_description)
         if (status not in self.non_terminal_states()) and (status not in self.failed_states()):
-            billable_time = (
-                self.last_description["TrainingEndTime"] - self.last_description["TrainingStartTime"]
-            ) * self.last_description["ResourceConfig"]["InstanceCount"]
-            self.log.info("Billable seconds: %s", (int(billable_time.total_seconds()) + 1))
+            instance_count = SageMakerHook.resolve_instance_count(
+                self.last_description.get("ResourceConfig", {})
+            )
+            if instance_count is not None:
+                billable_time = (
+                    self.last_description["TrainingEndTime"] - self.last_description["TrainingStartTime"]
+                ) * instance_count
+                self.log.info("Billable seconds: %s", (int(billable_time.total_seconds()) + 1))
         return self.last_description
 
     def get_failed_reason_from_response(self, response):

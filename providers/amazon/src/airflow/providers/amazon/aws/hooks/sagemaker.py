@@ -324,13 +324,7 @@ class SageMakerHook(AwsBaseHook):
                 check_interval,
                 max_ingestion_time,
             )
-
-            billable_seconds = SageMakerHook.count_billable_seconds(
-                training_start_time=describe_response["TrainingStartTime"],
-                training_end_time=describe_response["TrainingEndTime"],
-                instance_count=describe_response["ResourceConfig"]["InstanceCount"],
-            )
-            self.log.info("Billable seconds: %d", billable_seconds)
+            self._log_billable_seconds(describe_response)
 
         return response
 
@@ -786,9 +780,16 @@ class SageMakerHook(AwsBaseHook):
         sec = 0
         description = self.describe_training_job(job_name)
         self.log.info(secondary_training_status_message(description, None))
-        instance_count = description["ResourceConfig"]["InstanceCount"]
+        instance_count = SageMakerHook.resolve_instance_count(description.get("ResourceConfig", {}))
         status = description["TrainingJobStatus"]
-
+        if instance_count is None:
+            self.log.info(
+                "The instance count is not known yet because the job is still waiting for capacity, "
+                "so there are no log streams to tail."
+            )
+            if wait_for_completion:
+                self._poll_training_job(job_name, check_interval, max_ingestion_time)
+            return
         stream_names: list = []  # The list of log streams
         positions: dict = {}  # The current position in each stream, map of stream name -> position
 
@@ -844,12 +845,7 @@ class SageMakerHook(AwsBaseHook):
             if status in failed_states:
                 reason = last_description.get("FailureReason", "(No reason provided)")
                 raise AirflowException(f"Error training {job_name}: {status} Reason: {reason}")
-            billable_seconds = SageMakerHook.count_billable_seconds(
-                training_start_time=last_description["TrainingStartTime"],
-                training_end_time=last_description["TrainingEndTime"],
-                instance_count=instance_count,
-            )
-            self.log.info("Billable seconds: %d", billable_seconds)
+            self._log_billable_seconds(last_description)
 
     def list_training_jobs(
         self, name_contains: str | None = None, max_results: int | None = None, **kwargs
@@ -1300,6 +1296,49 @@ class SageMakerHook(AwsBaseHook):
             if "BestCandidate" in res:
                 return res["BestCandidate"]
         return None
+
+    @staticmethod
+    def resolve_instance_count(cluster_config: dict) -> int | None:
+        """
+        Return the number of instances a job runs on, or None while that is undecided.
+
+        A job that names one instance type reports the count in ``InstanceCount``. A job
+        that instead gives instance groups or an instance preference list reports
+        ``InstanceCount`` as 0 and carries the real count elsewhere: summed over the
+        groups, or in ``SelectedInstanceCount`` once a preferred type has been picked.
+        ``SelectedInstanceCount`` is absent while the job waits for capacity, and on
+        botocore versions that predate instance preferences.
+
+        :param cluster_config: ``ResourceConfig`` for a training job, or
+            ``ProcessingResources.ClusterConfig`` for a processing job.
+        """
+        instance_count = cluster_config.get("InstanceCount")
+        if instance_count:
+            return instance_count
+        if instance_groups := cluster_config.get("InstanceGroups"):
+            return sum(group["InstanceCount"] for group in instance_groups)
+        return cluster_config.get("SelectedInstanceCount")
+
+    def _log_billable_seconds(self, description: dict) -> None:
+        instance_count = SageMakerHook.resolve_instance_count(description.get("ResourceConfig", {}))
+        if instance_count is None:
+            return
+        billable_seconds = SageMakerHook.count_billable_seconds(
+            training_start_time=description["TrainingStartTime"],
+            training_end_time=description["TrainingEndTime"],
+            instance_count=instance_count,
+        )
+        self.log.info("Billable seconds: %d", billable_seconds)
+
+    def _poll_training_job(self, job_name: str, check_interval: int, max_ingestion_time: int | None) -> None:
+        describe_response = self.check_status(
+            job_name,
+            "TrainingJobStatus",
+            self.describe_training_job,
+            check_interval,
+            max_ingestion_time,
+        )
+        self._log_billable_seconds(describe_response)
 
     @staticmethod
     def count_billable_seconds(

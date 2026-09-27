@@ -46,6 +46,33 @@ DESCRIBE_TRAINING_FAILED_RESPONSE.update({"TrainingJobStatus": "Failed", "Failur
 DESCRIBE_TRAINING_STOPPING_RESPONSE = dict(DESCRIBE_TRAINING_COMPLETED_RESPONSE)
 DESCRIBE_TRAINING_STOPPING_RESPONSE.update({"TrainingJobStatus": "Stopping"})
 
+DESCRIBE_TRAINING_PREFERENCES_RESPONSE = dict(DESCRIBE_TRAINING_COMPLETED_RESPONSE)
+DESCRIBE_TRAINING_PREFERENCES_RESPONSE.update(
+    {
+        "ResourceConfig": {
+            "InstanceCount": 0,
+            "InstancePreferences": [
+                {"InstanceType": "ml.g6.48xlarge", "InstanceCount": 2},
+                {"InstanceType": "ml.g5.48xlarge", "InstanceCount": 4},
+            ],
+            "SelectedInstanceType": "ml.g5.48xlarge",
+            "SelectedInstanceCount": 4,
+            "VolumeSizeInGB": 10,
+        }
+    }
+)
+
+DESCRIBE_TRAINING_PENDING_CAPACITY_RESPONSE = dict(DESCRIBE_TRAINING_COMPLETED_RESPONSE)
+DESCRIBE_TRAINING_PENDING_CAPACITY_RESPONSE.update(
+    {
+        "ResourceConfig": {
+            "InstanceCount": 0,
+            "InstancePreferences": [{"InstanceType": "ml.g5.48xlarge", "InstanceCount": 4}],
+            "VolumeSizeInGB": 10,
+        }
+    }
+)
+
 
 class TestSageMakerTrainingSensor:
     @mock.patch.object(SageMakerHook, "get_conn")
@@ -94,6 +121,34 @@ class TestSageMakerTrainingSensor:
         calls = [mock.call(aws_conn_id="aws_test", config=None, verify=None, region_name=None)]
         hook_init.assert_has_calls(calls)
 
+    @pytest.mark.parametrize(
+        ("describe_response", "expected_instance_count"),
+        [
+            pytest.param(DESCRIBE_TRAINING_PREFERENCES_RESPONSE, 4, id="selected-instance-count"),
+            pytest.param(DESCRIBE_TRAINING_PENDING_CAPACITY_RESPONSE, None, id="waiting-for-capacity"),
+        ],
+    )
+    @mock.patch.object(SageMakerHook, "get_conn")
+    @mock.patch.object(SageMakerHook, "__init__")
+    @mock.patch.object(SageMakerHook, "describe_training_job")
+    def test_sensor_with_instance_preferences(
+        self, mock_describe_job, hook_init, mock_client, describe_response, expected_instance_count
+    ):
+        hook_init.return_value = None
+        mock_describe_job.side_effect = [describe_response]
+        sensor = SageMakerTrainingSensor(
+            task_id="test_task",
+            poke_interval=2,
+            aws_conn_id="aws_test",
+            job_name="test_job_name",
+            print_log=False,
+        )
+
+        assert sensor.poke({}) is True
+        assert SageMakerHook.resolve_instance_count(describe_response["ResourceConfig"]) == (
+            expected_instance_count
+        )
+
     @mock.patch.object(SageMakerHook, "get_conn")
     @mock.patch.object(AwsLogsHook, "get_conn")
     @mock.patch.object(SageMakerHook, "__init__")
@@ -125,3 +180,45 @@ class TestSageMakerTrainingSensor:
 
         calls = [mock.call(aws_conn_id="aws_test", config=None, verify=None, region_name=None)]
         hook_init.assert_has_calls(calls)
+
+    @pytest.mark.parametrize(
+        ("describe_response", "expected_instance_count"),
+        [
+            pytest.param(DESCRIBE_TRAINING_PREFERENCES_RESPONSE, 4, id="selected-instance-count"),
+            pytest.param(DESCRIBE_TRAINING_PENDING_CAPACITY_RESPONSE, None, id="waiting-for-capacity"),
+        ],
+    )
+    @mock.patch.object(SageMakerHook, "get_conn")
+    @mock.patch.object(AwsLogsHook, "get_conn")
+    @mock.patch.object(SageMakerHook, "__init__")
+    @mock.patch.object(SageMakerHook, "describe_training_job_with_log")
+    @mock.patch.object(SageMakerHook, "describe_training_job")
+    def test_sensor_with_log_and_instance_preferences(
+        self,
+        mock_describe_job,
+        mock_describe_job_with_log,
+        hook_init,
+        mock_log_client,
+        mock_client,
+        describe_response,
+        expected_instance_count,
+    ):
+        hook_init.return_value = None
+
+        mock_describe_job.return_value = describe_response
+        mock_describe_job_with_log.side_effect = [
+            (LogState.COMPLETE, describe_response, 0),
+        ]
+        sensor = SageMakerTrainingSensor(
+            task_id="test_task",
+            poke_interval=0,
+            aws_conn_id="aws_test",
+            job_name="test_job_name",
+            print_log=True,
+        )
+
+        sensor.execute(None)
+
+        assert sensor.instance_count == expected_instance_count
+        assert mock_describe_job.call_count == 1
+        assert mock_describe_job_with_log.called is (expected_instance_count is not None)

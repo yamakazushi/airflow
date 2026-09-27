@@ -171,6 +171,72 @@ class TestSageMakerTrainingOperator:
         self.sagemaker.execute(context=None)
         assert not mock_defer.called
 
+    @pytest.mark.parametrize(
+        ("resource_config", "expected_instance_count"),
+        [
+            pytest.param(
+                {
+                    "InstanceCount": 0,
+                    "InstancePreferences": [{"InstanceType": "ml.c6g.8xlarge", "InstanceCount": 4}],
+                    "SelectedInstanceType": "ml.c6g.8xlarge",
+                    "SelectedInstanceCount": 4,
+                },
+                4,
+                id="capacity-selected",
+            ),
+            pytest.param(
+                {
+                    "InstanceCount": 0,
+                    "InstancePreferences": [{"InstanceType": "ml.c6g.8xlarge", "InstanceCount": 4}],
+                },
+                None,
+                id="capacity-pending",
+            ),
+        ],
+    )
+    @mock.patch("airflow.providers.amazon.aws.operators.sagemaker.SageMakerTrainingOperator.defer")
+    @mock.patch.object(SageMakerHook, "count_billable_seconds")
+    @mock.patch.object(SageMakerHook, "describe_training_job_with_log")
+    @mock.patch.object(SageMakerHook, "describe_training_job")
+    @mock.patch.object(SageMakerHook, "create_training_job")
+    def test_operator_complete_before_defer_with_instance_preferences(
+        self,
+        mock_training,
+        mock_describe_training_job,
+        mock_describe_training_job_with_log,
+        mock_count_billable_seconds,
+        mock_defer,
+        resource_config,
+        expected_instance_count,
+    ):
+        description = {
+            "TrainingJobStatus": "Completed",
+            "ResourceConfig": resource_config,
+            "TrainingStartTime": datetime(2026, 9, 26),
+            "TrainingEndTime": datetime(2026, 9, 27),
+        }
+        mock_training.return_value = {
+            "TrainingJobArn": "test_arn",
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        }
+        mock_describe_training_job.return_value = description
+        mock_describe_training_job_with_log.return_value = (LogState.JOB_COMPLETE, description, 50)
+        mock_count_billable_seconds.return_value = 100
+
+        self.sagemaker.deferrable = True
+        self.sagemaker.wait_for_completion = True
+        self.sagemaker.check_if_job_exists = False
+
+        self.sagemaker.execute(context=None)
+
+        assert not mock_defer.called
+        if expected_instance_count is None:
+            mock_describe_training_job_with_log.assert_not_called()
+            mock_count_billable_seconds.assert_not_called()
+        else:
+            assert mock_describe_training_job_with_log.call_args.args[3] == expected_instance_count
+            assert mock_count_billable_seconds.call_args.kwargs["instance_count"] == expected_instance_count
+
     @mock.patch.object(
         SageMakerHook,
         "describe_training_job_with_log",
