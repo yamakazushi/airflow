@@ -45,6 +45,13 @@ class OpenSearchServerlessCreateCollectionOperator(AwsBaseOperator[OpenSearchSer
     :param description: Optional description. (templated)
     :param standby_replicas: Whether to use standby replicas (ENABLED or DISABLED).
     :param tags: Optional list of tag dicts.
+    :param deletion_protection: Whether to enable deletion protection for the collection
+        (ENABLED or DISABLED). Requires botocore >= 1.43.17.
+    :param vector_options: Optional vector options as a dict with a ``ServerlessVectorAcceleration``
+        key (ENABLED, DISABLED or ALLOWED).
+    :param collection_group_name: Optional name of the collection group to associate the collection with.
+    :param encryption_config: Optional encryption configuration as a dict with ``aWSOwnedKey`` (bool)
+        or ``kmsKeyArn``.
     :param if_exists: Behavior when the collection already exists.
         ``"fail"`` raises an error, ``"skip"`` logs and returns.
     """
@@ -60,6 +67,10 @@ class OpenSearchServerlessCreateCollectionOperator(AwsBaseOperator[OpenSearchSer
         description: str | None = None,
         standby_replicas: str | None = None,
         tags: list[dict[str, str]] | None = None,
+        deletion_protection: str | None = None,
+        vector_options: dict[str, str] | None = None,
+        collection_group_name: str | None = None,
+        encryption_config: dict[str, Any] | None = None,
         if_exists: Literal["fail", "skip"] = "skip",
         **kwargs,
     ) -> None:
@@ -69,6 +80,10 @@ class OpenSearchServerlessCreateCollectionOperator(AwsBaseOperator[OpenSearchSer
         self.description = description
         self.standby_replicas = standby_replicas
         self.tags = tags
+        self.deletion_protection = deletion_protection
+        self.vector_options = vector_options
+        self.collection_group_name = collection_group_name
+        self.encryption_config = encryption_config
         self.if_exists = if_exists
 
     def execute(self, context: Context) -> str:
@@ -80,6 +95,10 @@ class OpenSearchServerlessCreateCollectionOperator(AwsBaseOperator[OpenSearchSer
                 "description": self.description,
                 "standbyReplicas": self.standby_replicas,
                 "tags": self.tags,
+                "deletionProtection": self.deletion_protection,
+                "vectorOptions": self.vector_options,
+                "collectionGroupName": self.collection_group_name,
+                "encryptionConfig": self.encryption_config,
             }
         )
         try:

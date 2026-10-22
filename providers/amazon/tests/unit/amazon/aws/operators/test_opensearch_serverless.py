@@ -55,6 +55,40 @@ class TestOpenSearchServerlessCreateCollectionOperator:
         assert result == COLLECTION_ID
 
     @mock.patch.object(OpenSearchServerlessHook, "conn", new_callable=mock.PropertyMock)
+    def test_execute_with_optional_params(self, mock_conn):
+        vector_options = {"ServerlessVectorAcceleration": "ENABLED"}
+        encryption_config = {
+            "aWSOwnedKey": False,
+            "kmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/test-key",
+        }
+        op = OpenSearchServerlessCreateCollectionOperator(
+            task_id="create_collection",
+            collection_name=COLLECTION_NAME,
+            collection_type="VECTORSEARCH",
+            deletion_protection="ENABLED",
+            vector_options=vector_options,
+            collection_group_name="test-collection-group",
+            encryption_config=encryption_config,
+        )
+        mock_client = MagicMock()
+        mock_client.create_collection.return_value = {
+            "createCollectionDetail": {"id": COLLECTION_ID, "name": COLLECTION_NAME}
+        }
+        mock_conn.return_value = mock_client
+
+        result = op.execute({})
+
+        mock_client.create_collection.assert_called_once_with(
+            name=COLLECTION_NAME,
+            type="VECTORSEARCH",
+            deletionProtection="ENABLED",
+            vectorOptions=vector_options,
+            collectionGroupName="test-collection-group",
+            encryptionConfig=encryption_config,
+        )
+        assert result == COLLECTION_ID
+
+    @mock.patch.object(OpenSearchServerlessHook, "conn", new_callable=mock.PropertyMock)
     def test_execute_skip_existing(self, mock_conn):
         mock_client = MagicMock()
         mock_client.create_collection.side_effect = ClientError(
