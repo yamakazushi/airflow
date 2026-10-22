@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, PaginationError
 
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.providers.amazon.aws.operators.base_aws import AwsBaseOperator
@@ -310,11 +310,16 @@ class S3VectorsQueryVectorsOperator(AwsBaseOperator[AwsBaseHook]):
 
     :param vector_bucket_name: The name of the vector bucket. (templated)
     :param index_name: The name of the index. (templated)
-    :param top_k: The number of results to return.
+    :param top_k: The number of results to return. Results returned across multiple
+        pages are fetched and combined into a single list; large values produce
+        large XCom payloads.
     :param query_vector: The query vector dict (e.g. ``{"float32": [0.1, 0.2, ...]}``)
     :param filter: Optional filter expression dict.
     :param return_metadata: Whether to return metadata with results.
     :param return_distance: Whether to return distance scores.
+    :param query_mode: Optional query mode, ``CLASSIC`` or ``ENHANCED``. If not set,
+        the mode configured for the index is used. Requires a botocore version that
+        supports the ``queryMode`` parameter. (templated)
     """
 
     aws_hook_class = AwsBaseHook
@@ -323,6 +328,7 @@ class S3VectorsQueryVectorsOperator(AwsBaseOperator[AwsBaseHook]):
         "vector_bucket_name",
         "index_name",
         "top_k",
+        "query_mode",
     )
 
     def __init__(
@@ -335,6 +341,7 @@ class S3VectorsQueryVectorsOperator(AwsBaseOperator[AwsBaseHook]):
         filter: dict[str, Any] | None = None,
         return_metadata: bool = True,
         return_distance: bool = True,
+        query_mode: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -345,6 +352,7 @@ class S3VectorsQueryVectorsOperator(AwsBaseOperator[AwsBaseHook]):
         self.filter = filter
         self.return_metadata = return_metadata
         self.return_distance = return_distance
+        self.query_mode = query_mode
 
     @property
     def _hook_parameters(self) -> dict[str, Any]:
@@ -361,9 +369,18 @@ class S3VectorsQueryVectorsOperator(AwsBaseOperator[AwsBaseHook]):
                 "filter": self.filter,
                 "returnMetadata": self.return_metadata,
                 "returnDistance": self.return_distance,
+                "queryMode": self.query_mode,
             }
         )
         response = self.hook.conn.query_vectors(**kwargs)
-        vectors = response.get("vectors", [])
+        vectors = list(response.get("vectors", []))
+        # get_paginator("query_vectors") is unavailable on the minimum supported botocore.
+        previous_token = None
+        while next_token := response.get("nextToken"):
+            if next_token == previous_token:
+                raise PaginationError(message=f"The same next token was received twice: {next_token}")
+            previous_token = next_token
+            response = self.hook.conn.query_vectors(**kwargs, nextToken=next_token)
+            vectors.extend(response.get("vectors", []))
         self.log.info("Query returned %d results", len(vectors))
         return vectors

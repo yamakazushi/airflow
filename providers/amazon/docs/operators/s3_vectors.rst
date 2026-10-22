@@ -100,6 +100,8 @@ Query Vectors
 
 To query vectors by similarity in an Amazon S3 Vectors index, use
 :class:`~airflow.providers.amazon.aws.operators.s3_vectors.S3VectorsQueryVectorsOperator`.
+The operator follows ``nextToken`` and returns the results of all pages as a single list.
+Use ``query_mode`` to choose between ``CLASSIC`` and ``ENHANCED`` metadata filtering.
 
 .. exampleinclude:: /../../amazon/tests/system/amazon/aws/example_s3_vectors.py
     :language: python

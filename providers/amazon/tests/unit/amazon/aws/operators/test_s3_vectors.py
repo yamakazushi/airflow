@@ -19,7 +19,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, PaginationError
 
 from airflow.providers.amazon.aws.operators.s3_vectors import (
     S3VectorsCreateIndexOperator,
@@ -255,6 +255,15 @@ class TestS3VectorsPutVectorsOperator:
 
 QUERY_VECTOR = {"float32": [0.1, 0.2, 0.3, 0.4]}
 QUERY_RESULTS = [{"key": "vec1", "distance": 0.95, "metadata": {"label": "test"}}]
+QUERY_RESULTS_PAGE_2 = [{"key": "vec2", "distance": 0.90, "metadata": {"label": "test"}}]
+EXPECTED_QUERY_KWARGS = {
+    "vectorBucketName": BUCKET_NAME,
+    "indexName": INDEX_NAME,
+    "topK": 5,
+    "queryVector": QUERY_VECTOR,
+    "returnMetadata": True,
+    "returnDistance": True,
+}
 
 
 class TestS3VectorsQueryVectorsOperator:
@@ -294,6 +303,58 @@ class TestS3VectorsQueryVectorsOperator:
 
         call_kwargs = mock_conn.query_vectors.call_args[1]
         assert call_kwargs["filter"] == {"equals": {"key": "label", "value": "test"}}
+
+    @pytest.mark.parametrize(
+        "last_page",
+        [{"vectors": QUERY_RESULTS_PAGE_2}, {"vectors": QUERY_RESULTS_PAGE_2, "nextToken": ""}],
+        ids=["no_token", "empty_token"],
+    )
+    def test_execute_paginates(self, last_page):
+        mock_conn = MagicMock()
+        mock_conn.query_vectors.side_effect = [
+            {"vectors": QUERY_RESULTS, "nextToken": "token-1", "distanceMetric": "cosine"},
+            last_page,
+        ]
+        self.operator.hook.conn = mock_conn
+
+        result = self.operator.execute({})
+
+        assert result == QUERY_RESULTS + QUERY_RESULTS_PAGE_2
+        assert mock_conn.query_vectors.call_count == 2
+        assert mock_conn.query_vectors.call_args_list[0].kwargs == EXPECTED_QUERY_KWARGS
+        assert mock_conn.query_vectors.call_args_list[1].kwargs == {
+            **EXPECTED_QUERY_KWARGS,
+            "nextToken": "token-1",
+        }
+
+    def test_execute_raises_on_repeated_next_token(self):
+        mock_conn = MagicMock()
+        mock_conn.query_vectors.side_effect = [
+            {"vectors": QUERY_RESULTS, "nextToken": "token-1"},
+            {"vectors": QUERY_RESULTS_PAGE_2, "nextToken": "token-1"},
+        ]
+        self.operator.hook.conn = mock_conn
+
+        with pytest.raises(PaginationError, match="same next token"):
+            self.operator.execute({})
+        assert mock_conn.query_vectors.call_count == 2
+
+    def test_execute_with_query_mode(self):
+        op = S3VectorsQueryVectorsOperator(
+            task_id="query_vectors",
+            vector_bucket_name=BUCKET_NAME,
+            index_name=INDEX_NAME,
+            top_k=5,
+            query_vector=QUERY_VECTOR,
+            query_mode="ENHANCED",
+        )
+        mock_conn = MagicMock()
+        mock_conn.query_vectors.return_value = {"vectors": []}
+        op.hook.conn = mock_conn
+
+        op.execute({})
+
+        mock_conn.query_vectors.assert_called_once_with(**EXPECTED_QUERY_KWARGS, queryMode="ENHANCED")
 
     def test_template_fields(self):
         validate_template_fields(self.operator)
